@@ -36,6 +36,7 @@ from mujoco import viewer
 
 # Local scripts
 from tree_edit_distance import (
+    distances_to_targets,
     mean_plus_std_tree_edit_distance,
 )
 
@@ -510,7 +511,13 @@ def _run_ea(
     )
     for _ in range(settings.num_steps):
         ea.step()
-    return history
+
+    best_individual = ea.get_solution("best", only_alive=False)
+    best_body = _tree_genome(best_individual).to_networkx()
+    target_distances = list(distances_to_targets(best_body, targets))
+
+    return history, target_distances
+
 
 
 def _run_random_search(
@@ -543,6 +550,16 @@ def _write_history(path: Path, history: list[dict[str, float]], seed: int) -> No
         writer.writeheader()
         for generation, row in enumerate(history):
             writer.writerow({"seed": seed, "generation": generation, **row})
+
+def _write_target_distances(path: Path, distances: list[float], seed: int) -> None:
+    """Write final best body's distance to every target."""
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        fieldnames = ["seed", "target", "distance"]
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for target, distance in enumerate(distances, start=1):
+            writer.writerow({"seed": seed, "target": target,"distance": distance})
 
 
 # ============================================================================ #
@@ -584,8 +601,9 @@ def main() -> None:
     for variant in ("mutation", "crossover"):
         for seed in range(args.repeats):
             print(f"Starting {variant}, seed {seed}", flush=True)
-            history = _run_ea(variant, targets, seed, output_dir)
+            history, target_distances = _run_ea(variant, targets, seed, output_dir)
             _write_history(output_dir / f"{variant}_seed_{seed}.csv", history, seed)
+            _write_target_distances(output_dir / f"{variant}_seed_{seed}_targets.csv", target_distances, seed)
             print(f"Finished {variant}, seed {seed}", flush=True)
     for seed in range(args.repeats):
         print(f"Starting random search, seed {seed}", flush=True)

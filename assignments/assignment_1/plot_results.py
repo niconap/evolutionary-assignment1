@@ -40,7 +40,7 @@ def read_run(path: Path) -> dict[str, np.ndarray]:
 
 def load_runs(directory: Path, method: str) -> list[dict[str, np.ndarray]]:
     """Load all seed files for one method."""
-    paths = sorted(directory.glob(f"{method}_seed_*.csv"))
+    paths = sorted(path for path in directory.glob(f"{method}_seed_*.csv")if not path.name.endswith("_targets.csv"))
     if not paths:
         raise FileNotFoundError(f"no {method} CSV files found in {directory}")
     return [read_run(path) for path in paths]
