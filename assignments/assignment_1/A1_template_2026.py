@@ -20,9 +20,12 @@ of given target bodies at once.
 
 
 # Standard library
+import argparse
+import csv
+import copy
 import random
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 # Third-party libraries
 import mujoco as mj
@@ -33,9 +36,7 @@ from mujoco import viewer
 
 # Local scripts
 from tree_edit_distance import (
-    distances_to_targets,
     mean_plus_std_tree_edit_distance,
-    tree_edit_distance,
 )
 
 # Local libraries (ARIEL)
@@ -50,7 +51,16 @@ from ariel.body_phenotypes.robogen_lite.decoders.hi_prob_decoding import (
     HighProbabilityDecoder,
 )
 from ariel.ec.genotypes.nde import NeuralDevelopmentalEncoding
-from ariel.ec.genotypes.tree.operators import random_tree
+from ariel.ec import EA, EAOperation, EASettings, Individual, Population
+from ariel.ec.genotypes.tree.operators import (
+    crossover_subtree,
+    mutate_hoist,
+    mutate_replace_node,
+    mutate_shrink,
+    mutate_subtree_replacement,
+    random_tree,
+)
+from ariel.ec.genotypes.tree.tree_genome import TreeGenome
 from ariel.simulation.environments import SimpleFlatWorld
 from ariel.utils.renderers import single_frame_renderer, video_renderer
 from ariel.utils.video_recorder import VideoRecorder
@@ -58,6 +68,7 @@ from ariel.utils.video_recorder import VideoRecorder
 # Type aliases
 type GenotypeTypes = Literal["nde", "tree"]
 type ViewerTypes = Literal["launcher", "video", "frame", "none"]
+type BodyGraph = nx.DiGraph[Any, Any, Any]
 
 # --- RANDOM GENERATOR SETUP --- #
 # Fix the seed while you are debugging.
@@ -85,6 +96,11 @@ NUM_OF_MODULES: int = 20  # module budget per evolved body
 GENOTYPE: GenotypeTypes = "tree"  # "nde" | "tree" 
 MODE: ViewerTypes = "frame"  # see show_body() for the options
 SPAWN_POS: list[float] = [0.0, 0.0, 0.1]
+DEFAULT_POPULATION_SIZE: int = 75
+DEFAULT_GENERATIONS: int = 100
+DEFAULT_REPEATS: int = 5
+population_size_config: int = DEFAULT_POPULATION_SIZE
+generations_config: int = DEFAULT_GENERATIONS
 
 
 # ============================================================================ #
@@ -98,7 +114,7 @@ SPAWN_POS: list[float] = [0.0, 0.0, 0.1]
 # ============================================================================ #
 
 
-def load_targets(target_dir: Path = TARGET_DIR) -> list[nx.DiGraph]:
+def load_targets(target_dir: Path = TARGET_DIR) -> list[BodyGraph]:
     """Load every target body graph from a directory.
 
     Returns
@@ -191,7 +207,7 @@ _NDE = NeuralDevelopmentalEncoding(
 )
 
 
-def random_nde_body(num_modules: int = NUM_OF_MODULES) -> nx.DiGraph:
+def random_nde_body(num_modules: int = NUM_OF_MODULES) -> BodyGraph:
     """Sample a random NDE genotype and decode it into a body graph.
 
     THIS IS THE FUNCTION YOUR EA REPLACES. The three vectors below are the
@@ -212,7 +228,7 @@ def random_nde_body(num_modules: int = NUM_OF_MODULES) -> nx.DiGraph:
     return decoder.probability_matrices_to_graph(type_p, conn_p, rot_p)
 
 
-def random_tree_body(num_modules: int = NUM_OF_MODULES) -> nx.DiGraph:
+def random_tree_body(num_modules: int = NUM_OF_MODULES) -> BodyGraph:
     """Sample a random tree genotype and convert it into a body graph.
 
     THIS IS THE FUNCTION YOUR EA REPLACES. Here the genotype IS the tree, so
@@ -226,7 +242,7 @@ def random_tree_body(num_modules: int = NUM_OF_MODULES) -> nx.DiGraph:
 def random_body(
     genotype: GenotypeTypes = GENOTYPE,
     num_modules: int = NUM_OF_MODULES,
-) -> nx.DiGraph:
+) -> BodyGraph:
     """Sample one random body using the chosen encoding."""
     match genotype:
         case "nde":
@@ -253,8 +269,8 @@ def random_body(
 
 
 def fitness_function(
-    body: nx.DiGraph,
-    targets: list[nx.DiGraph],
+    body: BodyGraph,
+    targets: list[BodyGraph],
 ) -> float:
     """Score one body against the whole target set. LOWER IS BETTER.
 
@@ -274,7 +290,7 @@ def fitness_function(
 
 
 def show_body(
-    body: nx.DiGraph,
+    body: BodyGraph,
     mode: ViewerTypes = MODE,
     file_name: str = "body",
 ) -> None:
@@ -320,44 +336,264 @@ def show_body(
 
 
 # ============================================================================ #
-#  5. ENTRY POINT
+#  5. EVOLUTIONARY EXPERIMENTS
+# ============================================================================ #
+
+
+def _tree_individual() -> Individual:
+    """Create one unevaluated tree-genome individual."""
+    individual = Individual()
+    individual.genotype = random_tree(NUM_OF_MODULES).to_dict()
+    return individual
+
+
+def _tree_genome(individual: Individual) -> TreeGenome:
+    """Deserialize the tree genome stored by an Individual."""
+    return TreeGenome.from_dict(individual.genotype)
+
+
+def _evaluate_factory(
+    targets: list[BodyGraph],
+    history: list[dict[str, float]],
+    status_label: str = "EA",
+):
+    """Create an evaluation operation and record population statistics."""
+    def evaluate(population: Population) -> Population:
+        for individual in population:
+            if individual.alive and individual.requires_eval:
+                body = _tree_genome(individual).to_networkx()
+                individual.fitness = fitness_function(body, targets)
+
+        fitnesses = [
+            individual.fitness_
+            for individual in population
+            if individual.alive and individual.fitness_ is not None
+        ]
+        if fitnesses:
+            statistics = {
+                "best": min(fitnesses),
+                "mean": float(np.mean(fitnesses)),
+                "std": float(np.std(fitnesses)),
+            }
+            history.append(statistics)
+            generation = len(history) - 1
+            print(
+                f"[{status_label}] generation {generation}/"
+                f"{generations_config}: "
+                f"best={statistics['best']:.4f}, "
+                f"mean={statistics['mean']:.4f}",
+                flush=True,
+            )
+        return population
+
+    return evaluate
+
+
+def _select_parents(population: Population) -> Population:
+    """Mark the best half of a minimisation population as parents."""
+    ordered = population.sort(sort="min", attribute="fitness_")
+    parent_count = max(2, len(ordered) // 2)
+    for index, individual in enumerate(ordered):
+        individual.tags = {"parent": index < parent_count}
+    return population
+
+
+def _mutate_genome(genome: TreeGenome) -> None:
+    """Apply a bounded mixture of label and structural mutations."""
+    original = copy.deepcopy(genome)
+    mutation = random.choices(
+        ("replace", "subtree", "shrink", "hoist"),
+        weights=(0.50, 0.25, 0.15, 0.10),
+        k=1,
+    )[0]
+    if mutation == "replace":
+        mutate_replace_node(genome)
+    elif mutation == "subtree":
+        mutate_subtree_replacement(genome, max_modules=3)
+    elif mutation == "shrink":
+        mutate_shrink(genome)
+    else:
+        mutate_hoist(genome)
+
+    if len(genome.nodes) > NUM_OF_MODULES:
+        genome.nodes = original.nodes
+        genome.edges = original.edges
+
+
+def _reproduce_factory(use_crossover: bool):
+    """Create reproduction with optional subtree crossover."""
+    def reproduce(population: Population) -> Population:
+        parents = [
+            individual
+            for individual in population
+            if individual.tags.get("parent", False)
+        ]
+        offspring: list[Individual] = []
+        while len(population) + len(offspring) < 2 * population_size_config:
+            if use_crossover:
+                parent_a, parent_b = random.sample(parents, 2)
+                child_a, child_b = crossover_subtree(
+                    _tree_genome(parent_a),
+                    _tree_genome(parent_b),
+                )
+                child_genomes = [child_a, child_b]
+            else:
+                child_genomes = [_tree_genome(random.choice(parents))]
+
+            for genome in child_genomes:
+                _mutate_genome(genome)
+                child = Individual()
+                child.genotype = genome.to_dict()
+                offspring.append(child)
+                if len(population) + len(offspring) >= 2 * population_size_config:
+                    break
+
+        population.extend(offspring)
+        return population
+
+    return reproduce
+
+
+def _survivor_factory():
+    """Create elitist survivor selection for a minimisation problem."""
+    def keep_best(population: Population) -> Population:
+        ordered = population.sort(sort="min", attribute="fitness_")
+        survivors = {
+            id(individual)
+            for individual in ordered[:population_size_config]
+        }
+        for individual in population:
+            if id(individual) not in survivors:
+                individual.alive = False
+        return population
+
+    return keep_best
+
+
+def _run_ea(
+    variant: str,
+    targets: list[BodyGraph],
+    seed: int,
+    output_dir: Path,
+) -> list[dict[str, float]]:
+    """Run one seeded EA variant and return convergence statistics."""
+    random.seed(seed)
+    np.random.seed(seed)
+    history: list[dict[str, float]] = []
+    population = Population([
+        _tree_individual() for _ in range(population_size_config)
+    ])
+    status_label = f"{variant}, seed {seed}"
+    population = _evaluate_factory(targets, history, status_label)(population)
+    settings = EASettings(
+        is_maximisation=False,
+        num_steps=generations_config,
+        target_population_size=population_size_config,
+        output_folder=output_dir,
+        db_file_name=f"{variant}_seed_{seed}.db",
+        db_handling="delete",
+    )
+    operations = [
+        EAOperation(_select_parents),
+        EAOperation(_reproduce_factory(variant == "crossover")),
+        EAOperation(_evaluate_factory(targets, history, status_label)),
+        EAOperation(_survivor_factory()),
+    ]
+    ea = EA(
+        population,
+        operations=operations,
+        num_steps=settings.num_steps,
+        is_maximisation=settings.is_maximisation,
+        db_file_path=settings.db_file_path,
+        db_handling=settings.db_handling,
+        quiet=True,
+    )
+    for _ in range(settings.num_steps):
+        ea.step()
+    return history
+
+
+def _run_random_search(
+    targets: list[BodyGraph],
+    seed: int,
+    evaluations: int,
+) -> list[dict[str, float]]:
+    """Run random search using the same evaluation budget as one EA run."""
+    random.seed(seed)
+    best = float("inf")
+    history: list[dict[str, float]] = []
+    for evaluation in range(1, evaluations + 1):
+        body = random_tree(NUM_OF_MODULES).to_networkx()
+        best = min(best, fitness_function(body, targets))
+        history.append({"best": best, "mean": best, "std": 0.0})
+        if evaluation % population_size_config == 0 or evaluation == evaluations:
+            print(
+                f"[random, seed {seed}] evaluations "
+                f"{evaluation}/{evaluations}: best={best:.4f}",
+                flush=True,
+            )
+    return history
+
+
+def _write_history(path: Path, history: list[dict[str, float]], seed: int) -> None:
+    """Write convergence statistics for one run to CSV."""
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        fieldnames = ["seed", "generation", "best", "mean", "std"]
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for generation, row in enumerate(history):
+            writer.writerow({"seed": seed, "generation": generation, **row})
+
+
+# ============================================================================ #
+#  6. ENTRY POINT
 # ============================================================================ #
 
 
 def main() -> None:
-    """Score one randomly-sampled body against the target set."""
+    """Run both EA variants and the equal-budget random-search baseline."""
+    global population_size_config, generations_config
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--population", type=int, default=DEFAULT_POPULATION_SIZE)
+    parser.add_argument("--generations", type=int, default=DEFAULT_GENERATIONS)
+    parser.add_argument("--repeats", type=int, default=DEFAULT_REPEATS)
+    parser.add_argument("--demo", action="store_true")
+    args = parser.parse_args()
+
+    population_size_config = args.population
+    generations_config = args.generations
     targets = load_targets()
 
-    console.log(f"encoding      : {GENOTYPE}")
-    console.log(f"module budget : {NUM_OF_MODULES}")
-    console.log(f"targets       : {len(targets)} bodies from {TARGET_DIR.name}")
-    console.log(
-        "target sizes  : "
-        + ", ".join(str(t.number_of_nodes()) for t in targets),
+    print(
+        f"Starting Assignment 1 experiments: population={population_size_config}, "
+        f"generations={generations_config}, repeats={args.repeats}, "
+        f"evaluation budget={population_size_config * (generations_config + 1)} "
+        "per run",
+        flush=True,
     )
 
-    # How far apart are the targets from each other? Your fitness cannot go
-    # below the best possible compromise, and this is the clue to where that is.
-    spread = [
-        tree_edit_distance(a, b)
-        for i, a in enumerate(targets)
-        for b in targets[i + 1 :]
-    ]
-    console.log(f"target spread : mean pairwise distance {np.mean(spread):.2f}")
+    if args.demo:
+        body = random_body("tree", NUM_OF_MODULES)
+        console.log(f"demo fitness: {fitness_function(body, targets):.4f}")
+        show_body(body, MODE, file_name="random_tree")
+        return
 
-    # --- One random body --------------------------------------------------- #
-    body = random_body(GENOTYPE, NUM_OF_MODULES)
-    fitness = fitness_function(body, targets)
+    output_dir = DATA / "experiments"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    evaluation_budget = population_size_config * (generations_config + 1)
+    for variant in ("mutation", "crossover"):
+        for seed in range(args.repeats):
+            print(f"Starting {variant}, seed {seed}", flush=True)
+            history = _run_ea(variant, targets, seed, output_dir)
+            _write_history(output_dir / f"{variant}_seed_{seed}.csv", history, seed)
+            print(f"Finished {variant}, seed {seed}", flush=True)
+    for seed in range(args.repeats):
+        print(f"Starting random search, seed {seed}", flush=True)
+        history = _run_random_search(targets, seed, evaluation_budget)
+        _write_history(output_dir / f"random_seed_{seed}.csv", history, seed)
+        print(f"Finished random search, seed {seed}", flush=True)
 
-    console.log("")
-    console.log(f"random body   : {body.number_of_nodes()} modules")
-    console.log(
-        "per-target    : "
-        + ", ".join(f"{d:.1f}" for d in distances_to_targets(body, targets)),
-    )
-    console.log(f"fitness       : {fitness:.4f}   (lower is better)")
-
-    show_body(body, MODE, file_name=f"random_{GENOTYPE}")
+    print("All experiments finished.", flush=True)
 
 
 if __name__ == "__main__":
