@@ -34,7 +34,7 @@ def read_run(path: Path) -> dict[str, np.ndarray]:
         rows = list(csv.DictReader(handle))
     return {
         key: np.asarray([float(row[key]) for row in rows])
-        for key in ("generation", "best", "mean", "std")
+        for key in ("seed", "generation", "best", "mean", "std")
     }
 
 
@@ -44,6 +44,12 @@ def load_runs(directory: Path, method: str) -> list[dict[str, np.ndarray]]:
     if not paths:
         raise FileNotFoundError(f"no {method} CSV files found in {directory}")
     return [read_run(path) for path in paths]
+
+
+def seed_label(runs: list[dict[str, np.ndarray]]) -> str:
+    """Return the seed values represented by a set of run files."""
+    seeds = [int(run["seed"][0]) for run in runs]
+    return ", ".join(str(seed) for seed in seeds)
 
 
 def summarize_ea(
@@ -65,7 +71,7 @@ def summarize_random(
     """Sample random-search best-so-far at EA generation boundaries."""
     x = np.arange(generations + 1) * population_size
     best = np.asarray([
-        run["best"][x.astype(int)]
+        run["best"][np.maximum(x.astype(int) - 1, 0)]
         for run in runs
     ])
     return x, best.mean(axis=0), best.std(axis=0)
@@ -79,8 +85,10 @@ def plot_convergence(
 ) -> None:
     """Create the convergence plot with mean and across-seed spread."""
     figure, axis = plt.subplots(figsize=(9, 5.5), constrained_layout=True)
+    seed_labels: dict[str, str] = {}
     for method in METHODS:
         runs = load_runs(directory, method)
+        seed_labels[method] = seed_label(runs)
         if method == "random":
             x, mean, spread = summarize_random(
                 runs, population_size, generations,
@@ -103,18 +111,18 @@ def plot_convergence(
             alpha=0.15,
         )
 
-    axis.set_title("Assignment 1: morphology search convergence")
+    axis.set_title("Morphology search convergence")
     axis.set_xlabel("Body evaluations")
     axis.set_ylabel("Best fitness so far, lower is better")
     axis.grid(True, alpha=0.25)
     axis.legend(
         handles=[
             Line2D([0], [0], color=COLORS["mutation"], linewidth=2,
-                   label="Mutation only: mean best fitness"),
+                 label=f"Mutation only (seeds: {seed_labels['mutation']})"),
             Line2D([0], [0], color=COLORS["crossover"], linewidth=2,
-                   label="Crossover + mutation: mean best fitness"),
+                 label=f"Crossover + mutation (seeds: {seed_labels['crossover']})"),
             Line2D([0], [0], color=COLORS["random"], linewidth=2,
-                   label="Random search: mean best fitness"),
+                 label=f"Random search (seeds: {seed_labels['random']})"),
             Patch(facecolor="black", alpha=0.15,
                   label="Shading: +/- 1 SD across seeds"),
         ],
@@ -129,10 +137,12 @@ def plot_final_scores(directory: Path, output: Path) -> None:
     values: list[np.ndarray] = []
     labels: list[str] = []
     colors: list[str] = []
+    seed_labels: dict[str, str] = {}
     for method in METHODS:
         runs = load_runs(directory, method)
+        seed_labels[method] = seed_label(runs)
         values.append(np.asarray([run["best"][-1] for run in runs]))
-        labels.append(METHODS[method])
+        labels.append(f"{METHODS[method]}\nseeds: {seed_labels[method]}")
         colors.append(COLORS[method])
 
     figure, axis = plt.subplots(figsize=(8, 5.5), constrained_layout=True)
@@ -160,7 +170,7 @@ def plot_final_scores(directory: Path, output: Path) -> None:
             zorder=3,
         )
 
-    axis.set_title("Assignment 1: final best fitness across seeds")
+    axis.set_title("Final best fitness across seeds")
     axis.set_ylabel("Final best fitness, lower is better")
     axis.grid(axis="y", alpha=0.25)
     axis.legend(
@@ -189,8 +199,8 @@ def main() -> None:
         type=Path,
         default=Path.cwd() / "__data__" / "A1_template_2026" / "experiments",
     )
-    parser.add_argument("--population", type=int, default=20)
-    parser.add_argument("--generations", type=int, default=20)
+    parser.add_argument("--population", type=int, default=75)
+    parser.add_argument("--generations", type=int, default=100)
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
 
